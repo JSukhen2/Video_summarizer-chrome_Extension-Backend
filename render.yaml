@@ -2,7 +2,7 @@ services:
   - type: web
     name: video-analyzer-backend
     env: python
-    buildCommand: export CARGO_HOME=$HOME/.cargo && pip install -r requirements.txt
+    buildCommand: export CARGO_HOME=/tmp/cargo && mkdir -p /tmp/cargo && pip install -r requirements.txt
     startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --timeout 300
     envVars:
       - key: OPENAI_API_KEY
