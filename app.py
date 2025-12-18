@@ -10,7 +10,7 @@ from pathlib import Path
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
-import openai
+from openai import OpenAI
 import google.generativeai as genai
 from moviepy.editor import VideoFileClip
 import tavily
@@ -23,7 +23,7 @@ app = Flask(__name__)
 CORS(app)  # Chrome Extension에서 호출 가능하도록 CORS 허용
 
 # API 키 설정
-openai.api_key = os.getenv('OPENAI_API_KEY')
+openai_client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
 tavily_client = tavily.TavilyClient(api_key=os.getenv('TAVILY_API_KEY')) if os.getenv('TAVILY_API_KEY') else None
 
@@ -96,7 +96,7 @@ def whisper_transcribe(audio_path: str) -> dict:
     """OpenAI Whisper API로 음성을 텍스트로 변환"""
     try:
         with open(audio_path, 'rb') as audio_file:
-            transcript = openai.audio.transcriptions.create(
+            transcript = openai_client.audio.transcriptions.create(
                 model="whisper-1",
                 file=audio_file,
                 response_format="verbose_json",
