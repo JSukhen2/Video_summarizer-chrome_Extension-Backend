@@ -6,6 +6,7 @@ OpenAI Whisper + Gemini 2.5 Flash 하이브리드 분석 시스템
 import os
 import json
 import tempfile
+import time
 from pathlib import Path
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -63,32 +64,114 @@ def download_youtube_video(url: str) -> str:
     
     try:
         ydl_opts = {
-            'format': 'best[ext=mp4]/best',
+            'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
             'outtmpl': temp_video_path,
             'quiet': True,
             'no_warnings': True,
+            'merge_output_format': 'mp4',  # 비디오+오디오 병합
+            'postprocessors': [{
+                'key': 'FFmpegVideoConvertor',
+                'preferedformat': 'mp4',
+            }],
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
+        
+        # 파일이 완전히 다운로드되었는지 확인
+        max_wait = 10  # 최대 10초 대기
+        wait_count = 0
+        while wait_count < max_wait:
+            if os.path.exists(temp_video_path) and os.path.getsize(temp_video_path) > 0:
+                # 파일 크기가 안정화될 때까지 대기 (1초 동안 크기 변화 없음)
+                size1 = os.path.getsize(temp_video_path)
+                time.sleep(1)
+                size2 = os.path.getsize(temp_video_path)
+                if size1 == size2 and size1 > 1024:  # 최소 1KB 이상
+                    break
+            time.sleep(0.5)
+            wait_count += 0.5
+        
+        # 파일 검증
+        if not os.path.exists(temp_video_path):
+            raise Exception("다운로드된 파일이 존재하지 않습니다")
+        
+        file_size = os.path.getsize(temp_video_path)
+        if file_size == 0:
+            raise Exception("다운로드된 파일이 비어있습니다")
+        
+        if file_size < 1024:  # 1KB 미만
+            raise Exception(f"다운로드된 파일이 너무 작습니다 ({file_size} bytes)")
+        
+        print(f"YouTube 다운로드 완료: {temp_video_path} ({file_size} bytes)")
         return temp_video_path
     except Exception as e:
+        # 실패 시 임시 파일 정리
+        if os.path.exists(temp_video_path):
+            try:
+                os.unlink(temp_video_path)
+            except:
+                pass
         raise Exception(f"YouTube 다운로드 실패: {str(e)}")
 
 
 def extract_audio_from_video(video_path: str) -> str:
     """비디오에서 오디오 추출"""
+    # 파일 검증
+    if not os.path.exists(video_path):
+        raise Exception(f"비디오 파일이 존재하지 않습니다: {video_path}")
+    
+    file_size = os.path.getsize(video_path)
+    if file_size == 0:
+        raise Exception(f"비디오 파일이 비어있습니다: {video_path}")
+    
+    print(f"오디오 추출 시작: {video_path} ({file_size} bytes)")
+    
     temp_audio = tempfile.NamedTemporaryFile(delete=False, suffix='.mp3')
     temp_audio_path = temp_audio.name
     temp_audio.close()
     
     try:
+        # MoviePy가 파일을 읽을 수 있는지 먼저 확인
+        print("비디오 파일 로딩 중...")
         video = VideoFileClip(video_path)
+        
+        # duration 확인
+        if video.duration is None or video.duration <= 0:
+            video.close()
+            raise Exception("비디오 duration을 읽을 수 없습니다. 파일이 손상되었을 수 있습니다.")
+        
+        print(f"비디오 duration: {video.duration}초")
+        
+        # 오디오 추출
+        if video.audio is None:
+            video.close()
+            raise Exception("비디오에 오디오 트랙이 없습니다")
+        
+        print("오디오 추출 중...")
         audio = video.audio
-        audio.write_audiofile(temp_audio_path, verbose=False, logger=None)
+        audio.write_audiofile(
+            temp_audio_path, 
+            verbose=False, 
+            logger=None,
+            codec='mp3',
+            bitrate='192k'
+        )
         audio.close()
         video.close()
+        
+        # 오디오 파일 검증
+        if not os.path.exists(temp_audio_path) or os.path.getsize(temp_audio_path) == 0:
+            raise Exception("오디오 추출 실패: 생성된 파일이 비어있습니다")
+        
+        print(f"오디오 추출 완료: {temp_audio_path} ({os.path.getsize(temp_audio_path)} bytes)")
         return temp_audio_path
     except Exception as e:
+        # 실패 시 임시 파일 정리
+        if os.path.exists(temp_audio_path):
+            try:
+                os.unlink(temp_audio_path)
+            except:
+                pass
         raise Exception(f"오디오 추출 실패: {str(e)}")
 
 
