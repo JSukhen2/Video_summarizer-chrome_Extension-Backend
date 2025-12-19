@@ -277,12 +277,12 @@ def extract_audio_from_video(video_path: str) -> tuple:
 
 def split_audio_for_whisper(audio_path: str, max_size_mb: int = 24) -> list:
     """
-    오디오 파일이 Whisper API 제한(25MB)을 초과하면 청크로 분할
+    오디오 파일이 Whisper API 제한(25MB)을 초과하면 청크로 분할 (moviepy 사용)
     
     Returns:
         [(chunk_path, start_time), ...] 리스트
     """
-    from pydub import AudioSegment
+    from moviepy.editor import AudioFileClip
     
     file_size = os.path.getsize(audio_path)
     max_size_bytes = max_size_mb * 1024 * 1024
@@ -293,29 +293,39 @@ def split_audio_for_whisper(audio_path: str, max_size_mb: int = 24) -> list:
     print(f"오디오 파일이 {file_size / 1024 / 1024:.2f}MB로 제한 초과. 청킹 시작...")
     
     # 오디오 로드
-    audio = AudioSegment.from_mp3(audio_path)
-    duration_ms = len(audio)
+    audio = AudioFileClip(audio_path)
+    duration_sec = audio.duration
     
     # 파일 크기 기반으로 청크 수 계산 (약간의 여유 두고)
     num_chunks = int(file_size / max_size_bytes) + 1
-    chunk_duration_ms = duration_ms // num_chunks
+    chunk_duration_sec = duration_sec / num_chunks
     
     chunks = []
     for i in range(num_chunks):
-        start_ms = i * chunk_duration_ms
-        end_ms = min((i + 1) * chunk_duration_ms, duration_ms)
+        start_sec = i * chunk_duration_sec
+        end_sec = min((i + 1) * chunk_duration_sec, duration_sec)
         
-        chunk = audio[start_ms:end_ms]
+        # 청크 추출
+        chunk = audio.subclip(start_sec, end_sec)
         
         # 청크 파일 저장
         chunk_path = audio_path.replace('.mp3', f'_chunk{i}.mp3')
-        chunk.export(chunk_path, format='mp3', bitrate='64k')
+        chunk.write_audiofile(
+            chunk_path,
+            verbose=False,
+            logger=None,
+            codec='mp3',
+            bitrate='64k',
+            ffmpeg_params=['-ac', '1']
+        )
+        chunk.close()
         
         chunk_size = os.path.getsize(chunk_path)
-        print(f"청크 {i+1}/{num_chunks}: {start_ms/1000:.1f}s - {end_ms/1000:.1f}s ({chunk_size / 1024 / 1024:.2f}MB)")
+        print(f"청크 {i+1}/{num_chunks}: {start_sec:.1f}s - {end_sec:.1f}s ({chunk_size / 1024 / 1024:.2f}MB)")
         
-        chunks.append((chunk_path, start_ms / 1000))  # start_time in seconds
+        chunks.append((chunk_path, start_sec))
     
+    audio.close()
     return chunks
 
 
