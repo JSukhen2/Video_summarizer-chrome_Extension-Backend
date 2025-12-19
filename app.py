@@ -464,18 +464,53 @@ def extract_uniform_frames(video_path: str, num_frames: int = 10, max_width: int
         return []
 
 
-def upload_video_to_gemini(video_path: str) -> str:
-    """Gemini File API를 사용하여 비디오 업로드"""
+def upload_video_to_gemini(video_path: str) -> tuple:
+    """
+    Gemini File API를 사용하여 비디오 업로드
+    
+    Returns:
+        (video_file, is_new_api) - video_file 객체와 API 버전 플래그
+    """
     try:
-        # 파일 업로드
-        video_file = genai.upload_file(path=video_path)
-        return video_file.uri
+        # 최신 API 시도 (google-generativeai >= 0.4.0)
+        try:
+            from google import genai as genai_new
+            client = genai_new.Client(api_key=os.getenv('GEMINI_API_KEY'))
+            video_file = client.files.upload(path=video_path)
+            # 처리 완료 대기
+            while video_file.state.name == "PROCESSING":
+                time.sleep(2)
+                video_file = client.files.get(name=video_file.name)
+            if video_file.state.name == "FAILED":
+                raise Exception("비디오 처리 실패")
+            return (video_file, True)  # (file_object, is_new_api)
+        except (ImportError, AttributeError):
+            # 구버전 API (google-generativeai < 0.4.0)
+            if hasattr(genai, 'upload_file'):
+                video_file = genai.upload_file(path=video_path)
+                # 처리 완료 대기
+                while video_file.state.name == "PROCESSING":
+                    time.sleep(2)
+                    video_file = genai.get_file(video_file.name)
+                if video_file.state.name == "FAILED":
+                    raise Exception("비디오 처리 실패")
+                return (video_file, False)  # (file_object, is_new_api)
+            else:
+                raise Exception("upload_file 메서드를 사용할 수 없습니다. google-generativeai 패키지를 업데이트하세요: pip install --upgrade google-generativeai")
     except Exception as e:
         raise Exception(f"Gemini 파일 업로드 실패: {str(e)}")
 
 
-def analyze_with_gemini(video_uri: str, transcript: dict, video_duration: float = None) -> dict:
-    """Gemini로 비디오와 스크립트를 함께 분석 (주요 프레임 타임스탬프 포함)"""
+def analyze_with_gemini(video_file_obj, transcript: dict, video_duration: float = None, is_new_api: bool = False) -> dict:
+    """
+    Gemini로 비디오와 스크립트를 함께 분석 (주요 프레임 타임스탬프 포함)
+    
+    Args:
+        video_file_obj: Gemini에 업로드된 비디오 파일 객체
+        transcript: Whisper로 생성된 스크립트
+        video_duration: 비디오 길이 (초)
+        is_new_api: 최신 API 사용 여부
+    """
     try:
         model = genai.GenerativeModel(GEMINI_MODEL)
         
@@ -555,11 +590,9 @@ def analyze_with_gemini(video_uri: str, transcript: dict, video_duration: float 
   ]
 }}"""
         
-        # 비디오 파일 참조
-        video_file = genai.get_file(video_uri.split('/')[-1])
-        
+        # 비디오 파일 객체를 직접 사용 (최신/구버전 모두 동일)
         response = model.generate_content(
-            [prompt, video_file],
+            [prompt, video_file_obj],
             generation_config={
                 'temperature': 0.2,
                 'max_output_tokens': 8000,
@@ -645,11 +678,11 @@ def analyze_video():
             
             # 3. Gemini에 비디오 업로드
             print("Gemini에 비디오 업로드 중...")
-            video_uri = upload_video_to_gemini(temp_video_path)
+            video_file_obj, is_new_api = upload_video_to_gemini(temp_video_path)
             
             # 4. Gemini 분석 (duration 포함)
             print("Gemini 분석 중...")
-            analysis = analyze_with_gemini(video_uri, transcript, video_duration)
+            analysis = analyze_with_gemini(video_file_obj, transcript, video_duration, is_new_api)
             
             # 5. Gemini가 식별한 주요 프레임 추출
             key_frames_with_images = []
