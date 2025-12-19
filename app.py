@@ -1,12 +1,14 @@
 """
 Video Analysis Backend Server
-OpenAI Whisper + Gemini 2.5 Flash 하이브리드 분석 시스템
+OpenAI Whisper + Gemini 2.0 Flash 하이브리드 분석 시스템
++ 주요 프레임 추출 기능 (다이어그램, 슬라이드, 중요 장면)
 """
 
 import os
 import json
 import tempfile
 import time
+import base64
 from pathlib import Path
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -16,6 +18,8 @@ import google.generativeai as genai
 from moviepy.editor import VideoFileClip
 import tavily
 import yt_dlp
+from PIL import Image
+import io
 
 # 환경 변수 로드
 load_dotenv()
@@ -123,8 +127,8 @@ def download_youtube_video(url: str) -> str:
         raise Exception(f"YouTube 다운로드 실패: {str(e)}")
 
 
-def extract_audio_from_video(video_path: str) -> str:
-    """비디오에서 오디오 추출"""
+def extract_audio_from_video(video_path: str) -> tuple:
+    """비디오에서 오디오 추출 및 duration 반환"""
     # 파일 검증
     if not os.path.exists(video_path):
         raise Exception(f"비디오 파일이 존재하지 않습니다: {video_path}")
@@ -149,7 +153,8 @@ def extract_audio_from_video(video_path: str) -> str:
             video.close()
             raise Exception("비디오 duration을 읽을 수 없습니다. 파일이 손상되었을 수 있습니다.")
         
-        print(f"비디오 duration: {video.duration}초")
+        video_duration = video.duration
+        print(f"비디오 duration: {video_duration}초")
         
         # 오디오 추출
         if video.audio is None:
@@ -173,7 +178,7 @@ def extract_audio_from_video(video_path: str) -> str:
             raise Exception("오디오 추출 실패: 생성된 파일이 비어있습니다")
         
         print(f"오디오 추출 완료: {temp_audio_path} ({os.path.getsize(temp_audio_path)} bytes)")
-        return temp_audio_path
+        return temp_audio_path, video_duration
     except Exception as e:
         # 실패 시 임시 파일 정리
         if os.path.exists(temp_audio_path):
@@ -209,6 +214,96 @@ def whisper_transcribe(audio_path: str) -> dict:
         raise Exception(f"Whisper STT 실패: {str(e)}")
 
 
+def extract_frames_at_timestamps(video_path: str, timestamps: list, max_width: int = 800) -> list:
+    """
+    비디오에서 특정 타임스탬프의 프레임을 추출하여 Base64로 반환
+    
+    Args:
+        video_path: 비디오 파일 경로
+        timestamps: 추출할 타임스탬프 리스트 (초 단위)
+        max_width: 이미지 최대 너비 (리사이즈용)
+    
+    Returns:
+        [{ "timestamp": float, "imageBase64": str, "width": int, "height": int }]
+    """
+    frames = []
+    
+    try:
+        video = VideoFileClip(video_path)
+        duration = video.duration
+        
+        for ts in timestamps:
+            try:
+                # 타임스탬프가 비디오 길이를 초과하면 스킵
+                if ts >= duration or ts < 0:
+                    continue
+                
+                # 프레임 추출
+                frame = video.get_frame(ts)
+                
+                # numpy array를 PIL Image로 변환
+                img = Image.fromarray(frame)
+                
+                # 리사이즈 (가로 기준)
+                if img.width > max_width:
+                    ratio = max_width / img.width
+                    new_height = int(img.height * ratio)
+                    img = img.resize((max_width, new_height), Image.Resampling.LANCZOS)
+                
+                # Base64로 인코딩
+                buffer = io.BytesIO()
+                img.save(buffer, format='JPEG', quality=85)
+                img_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+                
+                frames.append({
+                    'timestamp': ts,
+                    'imageBase64': img_base64,
+                    'width': img.width,
+                    'height': img.height
+                })
+                
+            except Exception as e:
+                print(f"프레임 추출 실패 (timestamp={ts}): {e}")
+                continue
+        
+        video.close()
+        
+    except Exception as e:
+        print(f"비디오 프레임 추출 실패: {e}")
+    
+    return frames
+
+
+def extract_uniform_frames(video_path: str, num_frames: int = 10, max_width: int = 800) -> list:
+    """
+    비디오에서 균등 간격으로 프레임을 추출
+    
+    Args:
+        video_path: 비디오 파일 경로
+        num_frames: 추출할 프레임 수
+        max_width: 이미지 최대 너비
+    
+    Returns:
+        프레임 리스트
+    """
+    try:
+        video = VideoFileClip(video_path)
+        duration = video.duration
+        video.close()
+        
+        # 균등 간격 타임스탬프 계산
+        timestamps = []
+        for i in range(num_frames):
+            ts = (i + 0.5) * duration / num_frames  # 각 구간의 중간점
+            timestamps.append(ts)
+        
+        return extract_frames_at_timestamps(video_path, timestamps, max_width)
+        
+    except Exception as e:
+        print(f"균등 프레임 추출 실패: {e}")
+        return []
+
+
 def upload_video_to_gemini(video_path: str) -> str:
     """Gemini File API를 사용하여 비디오 업로드"""
     try:
@@ -219,8 +314,8 @@ def upload_video_to_gemini(video_path: str) -> str:
         raise Exception(f"Gemini 파일 업로드 실패: {str(e)}")
 
 
-def analyze_with_gemini(video_uri: str, transcript: dict) -> dict:
-    """Gemini로 비디오와 스크립트를 함께 분석"""
+def analyze_with_gemini(video_uri: str, transcript: dict, video_duration: float = None) -> dict:
+    """Gemini로 비디오와 스크립트를 함께 분석 (주요 프레임 타임스탬프 포함)"""
     try:
         model = genai.GenerativeModel(GEMINI_MODEL)
         
@@ -231,10 +326,13 @@ def analyze_with_gemini(video_uri: str, transcript: dict) -> dict:
             for seg in transcript.get('segments', [])
         ])
         
+        duration_info = f"비디오 길이: {int(video_duration // 60)}분 {int(video_duration % 60)}초" if video_duration else ""
+        
         prompt = f"""{SYSTEM_PROMPT}
 
 ## 비디오 정보
 비디오 파일이 첨부되어 있습니다.
+{duration_info}
 
 ## 음성 스크립트 (Whisper)
 {transcript_text}
@@ -262,24 +360,40 @@ def analyze_with_gemini(video_uri: str, transcript: dict) -> dict:
 - 각 키워드는 "키워드: 한줄 설명" 형식으로 작성하세요.
 - 예: "SEO: 검색엔진 최적화로 웹사이트 노출을 높이는 마케팅 기법"
 
+**[주요 프레임 식별 - 중요] ★NEW★**
+- 비디오에서 시각적으로 중요한 장면의 타임스탬프를 식별하세요.
+- 다이어그램, 차트, 슬라이드, 도표, 코드, 중요 텍스트가 표시된 장면을 찾으세요.
+- 각 섹션별로 가장 대표적인 시각 자료가 나오는 순간을 선택하세요.
+- 최소 3개, 최대 8개의 주요 프레임을 식별하세요.
+- timestampSeconds는 반드시 초 단위 숫자로 입력하세요.
+
 **JSON 형식:**
 {{
-  "summary": "상세하고 정밀한 요약. 줄 수 제한 없이 핵심 내용을 모두 포함. 나중에 참조 자료로 활용할 수 있도록 구체적인 정보, 수치, 사례, 방법론 등을 포함하여 작성.",
+  "summary": "상세하고 정밀한 요약. 줄 수 제한 없이 핵심 내용을 모두 포함.",
   "tableOfContents": [
     {{
       "timestamp": "00:00",
-      "title": "구체적인 섹션 제목 (예: 마케팅의 정의와 핵심 개념)",
-      "description": "구체적인 섹션 설명 (지시대명사 없이)",
-      "summary": "상세 요약 (지시대명사 없이 구체적으로, 해당 섹션의 모든 핵심 내용 포함)",
-      "keyPoints": ["구체적인 포인트1", "구체적인 포인트2", "구체적인 포인트3"]
+      "timestampSeconds": 0,
+      "title": "구체적인 섹션 제목",
+      "description": "구체적인 섹션 설명",
+      "summary": "상세 요약",
+      "keyPoints": ["포인트1", "포인트2", "포인트3"]
     }}
   ],
   "keywords": ["키워드1: 한줄 설명", "키워드2: 한줄 설명"],
-  "keyInsights": ["구체적인 인사이트1", "구체적인 인사이트2"],
+  "keyInsights": ["인사이트1", "인사이트2"],
   "difficulty": "beginner|intermediate|advanced",
-  "category": "카테고리"
-}}
-"""
+  "category": "카테고리",
+  "keyFrames": [
+    {{
+      "timestampSeconds": 30,
+      "timestamp": "00:30",
+      "description": "프레임에 표시된 내용 설명 (예: 마케팅 4P 전략 다이어그램)",
+      "type": "diagram|chart|slide|code|screenshot|scene",
+      "relatedSection": "관련 섹션 제목"
+    }}
+  ]
+}}"""
         
         # 비디오 파일 참조
         video_file = genai.get_file(video_uri.split('/')[-1])
@@ -327,7 +441,7 @@ def health():
 
 @app.route('/analyze', methods=['POST'])
 def analyze_video():
-    """비디오 분석 엔드포인트"""
+    """비디오 분석 엔드포인트 (주요 프레임 추출 포함)"""
     try:
         temp_video_path = None
         
@@ -361,9 +475,9 @@ def analyze_video():
             return jsonify({'error': '비디오 파일 또는 YouTube URL이 필요합니다'}), 400
         
         try:
-            # 1. 오디오 추출
+            # 1. 오디오 추출 + duration 가져오기
             print("오디오 추출 중...")
-            audio_path = extract_audio_from_video(temp_video_path)
+            audio_path, video_duration = extract_audio_from_video(temp_video_path)
             
             # 2. Whisper STT
             print("Whisper STT 중...")
@@ -373,15 +487,58 @@ def analyze_video():
             print("Gemini에 비디오 업로드 중...")
             video_uri = upload_video_to_gemini(temp_video_path)
             
-            # 4. Gemini 분석
+            # 4. Gemini 분석 (duration 포함)
             print("Gemini 분석 중...")
-            analysis = analyze_with_gemini(video_uri, transcript)
+            analysis = analyze_with_gemini(video_uri, transcript, video_duration)
             
-            # 결과 반환
+            # 5. Gemini가 식별한 주요 프레임 추출
+            key_frames_with_images = []
+            if 'keyFrames' in analysis and analysis['keyFrames']:
+                print(f"주요 프레임 {len(analysis['keyFrames'])}개 추출 중...")
+                
+                # Gemini가 식별한 타임스탬프 추출
+                timestamps = [
+                    kf.get('timestampSeconds', 0) 
+                    for kf in analysis['keyFrames'] 
+                    if isinstance(kf.get('timestampSeconds'), (int, float))
+                ]
+                
+                # 프레임 추출
+                extracted_frames = extract_frames_at_timestamps(temp_video_path, timestamps)
+                
+                # 메타데이터와 이미지 결합
+                for i, kf in enumerate(analysis['keyFrames']):
+                    ts = kf.get('timestampSeconds', 0)
+                    # 해당 타임스탬프의 이미지 찾기
+                    matched_frame = next(
+                        (f for f in extracted_frames if abs(f['timestamp'] - ts) < 1),
+                        None
+                    )
+                    
+                    frame_data = {
+                        'timestamp': kf.get('timestamp', '00:00'),
+                        'timestampSeconds': ts,
+                        'description': kf.get('description', ''),
+                        'type': kf.get('type', 'scene'),
+                        'relatedSection': kf.get('relatedSection', '')
+                    }
+                    
+                    if matched_frame:
+                        frame_data['imageBase64'] = matched_frame['imageBase64']
+                        frame_data['width'] = matched_frame['width']
+                        frame_data['height'] = matched_frame['height']
+                    
+                    key_frames_with_images.append(frame_data)
+                
+                print(f"프레임 추출 완료: {len(key_frames_with_images)}개")
+            
+            # 6. 결과 반환 (이미지 포함)
             return jsonify({
                 'success': True,
                 'transcript': transcript,
-                'analysis': analysis
+                'analysis': analysis,
+                'keyFrames': key_frames_with_images,
+                'duration': video_duration
             })
             
         finally:
@@ -472,4 +629,3 @@ def question_answer():
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
-
