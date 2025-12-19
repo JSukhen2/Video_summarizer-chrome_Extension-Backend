@@ -354,9 +354,9 @@ def whisper_transcribe(audio_path: str) -> dict:
             # 세그먼트에 시간 오프셋 추가
             for seg in getattr(transcript, 'segments', []):
                 all_segments.append({
-                    'start': seg.get('start', 0) + time_offset,
-                    'end': seg.get('end', 0) + time_offset,
-                    'text': seg.get('text', '')
+                    'start': getattr(seg, 'start', 0) + time_offset,
+                    'end': getattr(seg, 'end', 0) + time_offset,
+                    'text': getattr(seg, 'text', '')
                 })
             
             # 청크 파일 정리 (원본 제외)
