@@ -10,4 +10,5 @@ werkzeug==3.0.1
 gunicorn==21.2.0
 yt-dlp>=2025.12.8
 Pillow>=10.0.0
+pydub>=0.25.1
 

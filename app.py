@@ -246,12 +246,14 @@ def extract_audio_from_video(video_path: str) -> tuple:
         
         print("오디오 추출 중...")
         audio = video.audio
+        # 모노로 변환하고 낮은 비트레이트 사용 (음성 인식에 충분함)
         audio.write_audiofile(
             temp_audio_path, 
             verbose=False, 
             logger=None,
             codec='mp3',
-            bitrate='192k'
+            bitrate='64k',  # 64kbps로 낮춤 (음성 인식에 충분)
+            ffmpeg_params=['-ac', '1']  # 모노로 변환 (크기 절반)
         )
         audio.close()
         video.close()
@@ -260,7 +262,8 @@ def extract_audio_from_video(video_path: str) -> tuple:
         if not os.path.exists(temp_audio_path) or os.path.getsize(temp_audio_path) == 0:
             raise Exception("오디오 추출 실패: 생성된 파일이 비어있습니다")
         
-        print(f"오디오 추출 완료: {temp_audio_path} ({os.path.getsize(temp_audio_path)} bytes)")
+        audio_size = os.path.getsize(temp_audio_path)
+        print(f"오디오 추출 완료: {temp_audio_path} ({audio_size} bytes, {audio_size / 1024 / 1024:.2f} MB)")
         return temp_audio_path, video_duration
     except Exception as e:
         # 실패 시 임시 파일 정리
@@ -272,26 +275,90 @@ def extract_audio_from_video(video_path: str) -> tuple:
         raise Exception(f"오디오 추출 실패: {str(e)}")
 
 
+def split_audio_for_whisper(audio_path: str, max_size_mb: int = 24) -> list:
+    """
+    오디오 파일이 Whisper API 제한(25MB)을 초과하면 청크로 분할
+    
+    Returns:
+        [(chunk_path, start_time), ...] 리스트
+    """
+    from pydub import AudioSegment
+    
+    file_size = os.path.getsize(audio_path)
+    max_size_bytes = max_size_mb * 1024 * 1024
+    
+    if file_size <= max_size_bytes:
+        return [(audio_path, 0)]
+    
+    print(f"오디오 파일이 {file_size / 1024 / 1024:.2f}MB로 제한 초과. 청킹 시작...")
+    
+    # 오디오 로드
+    audio = AudioSegment.from_mp3(audio_path)
+    duration_ms = len(audio)
+    
+    # 파일 크기 기반으로 청크 수 계산 (약간의 여유 두고)
+    num_chunks = int(file_size / max_size_bytes) + 1
+    chunk_duration_ms = duration_ms // num_chunks
+    
+    chunks = []
+    for i in range(num_chunks):
+        start_ms = i * chunk_duration_ms
+        end_ms = min((i + 1) * chunk_duration_ms, duration_ms)
+        
+        chunk = audio[start_ms:end_ms]
+        
+        # 청크 파일 저장
+        chunk_path = audio_path.replace('.mp3', f'_chunk{i}.mp3')
+        chunk.export(chunk_path, format='mp3', bitrate='64k')
+        
+        chunk_size = os.path.getsize(chunk_path)
+        print(f"청크 {i+1}/{num_chunks}: {start_ms/1000:.1f}s - {end_ms/1000:.1f}s ({chunk_size / 1024 / 1024:.2f}MB)")
+        
+        chunks.append((chunk_path, start_ms / 1000))  # start_time in seconds
+    
+    return chunks
+
+
 def whisper_transcribe(audio_path: str) -> dict:
-    """OpenAI Whisper API로 음성을 텍스트로 변환"""
+    """OpenAI Whisper API로 음성을 텍스트로 변환 (대용량 파일 자동 청킹)"""
     try:
-        with open(audio_path, 'rb') as audio_file:
-            transcript = openai_client.audio.transcriptions.create(
-                model="whisper-1",
-                file=audio_file,
-                response_format="verbose_json",
-                language="ko"
-            )
-        return {
-            'text': transcript.text,
-            'segments': [
-                {
-                    'start': seg.get('start', 0),
-                    'end': seg.get('end', 0),
+        # 파일 크기 확인 및 필요시 청킹
+        chunks = split_audio_for_whisper(audio_path)
+        
+        all_text = []
+        all_segments = []
+        
+        for chunk_idx, (chunk_path, time_offset) in enumerate(chunks):
+            print(f"Whisper 처리 중... ({chunk_idx + 1}/{len(chunks)})")
+            
+            with open(chunk_path, 'rb') as audio_file:
+                transcript = openai_client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=audio_file,
+                    response_format="verbose_json",
+                    language="ko"
+                )
+            
+            all_text.append(transcript.text)
+            
+            # 세그먼트에 시간 오프셋 추가
+            for seg in getattr(transcript, 'segments', []):
+                all_segments.append({
+                    'start': seg.get('start', 0) + time_offset,
+                    'end': seg.get('end', 0) + time_offset,
                     'text': seg.get('text', '')
-                }
-                for seg in getattr(transcript, 'segments', [])
-            ]
+                })
+            
+            # 청크 파일 정리 (원본 제외)
+            if chunk_path != audio_path:
+                try:
+                    os.unlink(chunk_path)
+                except:
+                    pass
+        
+        return {
+            'text': ' '.join(all_text),
+            'segments': all_segments
         }
     except Exception as e:
         raise Exception(f"Whisper STT 실패: {str(e)}")
