@@ -33,7 +33,9 @@ genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
 tavily_client = tavily.TavilyClient(api_key=os.getenv('TAVILY_API_KEY')) if os.getenv('TAVILY_API_KEY') else None
 
 # Gemini 모델 설정
-GEMINI_MODEL = 'gemini-2.0-flash-exp'
+# 무료 티어 호환: gemini-1.5-flash (안정적), gemini-1.5-pro (더 강력)
+# 실험 모델: gemini-2.0-flash-exp (무료 티어 제한 있음)
+GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-1.5-flash')
 
 # 시스템 프롬프트
 SYSTEM_PROMPT = """### System Prompt: Video Analysis & Research Expert
@@ -504,6 +506,7 @@ def upload_video_to_gemini(video_path: str) -> tuple:
 def analyze_with_gemini(video_file_obj, transcript: dict, video_duration: float = None, is_new_api: bool = False) -> dict:
     """
     Gemini로 비디오와 스크립트를 함께 분석 (주요 프레임 타임스탬프 포함)
+    429 에러 시 자동 재시도 포함
     
     Args:
         video_file_obj: Gemini에 업로드된 비디오 파일 객체
@@ -511,19 +514,23 @@ def analyze_with_gemini(video_file_obj, transcript: dict, video_duration: float 
         video_duration: 비디오 길이 (초)
         is_new_api: 최신 API 사용 여부
     """
-    try:
-        model = genai.GenerativeModel(GEMINI_MODEL)
-        
-        # 스크립트 포맷팅
-        transcript_text = transcript['text']
-        segments_text = '\n'.join([
-            f"[{int(seg['start']//60):02d}:{int(seg['start']%60):02d}] {seg['text']}"
-            for seg in transcript.get('segments', [])
-        ])
-        
-        duration_info = f"비디오 길이: {int(video_duration // 60)}분 {int(video_duration % 60)}초" if video_duration else ""
-        
-        prompt = f"""{SYSTEM_PROMPT}
+    max_retries = 3
+    retry_delay = 60  # 기본 재시도 대기 시간 (초)
+    
+    for attempt in range(max_retries):
+        try:
+            model = genai.GenerativeModel(GEMINI_MODEL)
+            
+            # 스크립트 포맷팅
+            transcript_text = transcript['text']
+            segments_text = '\n'.join([
+                f"[{int(seg['start']//60):02d}:{int(seg['start']%60):02d}] {seg['text']}"
+                for seg in transcript.get('segments', [])
+            ])
+            
+            duration_info = f"비디오 길이: {int(video_duration // 60)}분 {int(video_duration % 60)}초" if video_duration else ""
+            
+            prompt = f"""{SYSTEM_PROMPT}
 
 ## 비디오 정보
 비디오 파일이 첨부되어 있습니다.
@@ -589,23 +596,45 @@ def analyze_with_gemini(video_file_obj, transcript: dict, video_duration: float 
     }}
   ]
 }}"""
-        
-        # 비디오 파일 객체를 직접 사용 (최신/구버전 모두 동일)
-        response = model.generate_content(
-            [prompt, video_file_obj],
-            generation_config={
-                'temperature': 0.2,
-                'max_output_tokens': 8000,
-                'response_mime_type': 'application/json'
-            }
-        )
-        
-        # JSON 파싱
-        result = json.loads(response.text)
-        return result
-        
-    except Exception as e:
-        raise Exception(f"Gemini 분석 실패: {str(e)}")
+            
+            # 비디오 파일 객체를 직접 사용 (최신/구버전 모두 동일)
+            response = model.generate_content(
+                [prompt, video_file_obj],
+                generation_config={
+                    'temperature': 0.2,
+                    'max_output_tokens': 8000,
+                    'response_mime_type': 'application/json'
+                }
+            )
+            
+            # JSON 파싱
+            result = json.loads(response.text)
+            return result
+            
+        except Exception as e:
+            error_str = str(e)
+            
+            # 429 에러 (할당량 초과) 처리
+            if '429' in error_str or 'quota' in error_str.lower() or 'rate limit' in error_str.lower():
+                # retry_delay 추출 시도
+                import re
+                delay_match = re.search(r'retry.*?(\d+(?:\.\d+)?)', error_str, re.IGNORECASE)
+                if delay_match:
+                    retry_delay = int(float(delay_match.group(1))) + 5  # 여유 시간 추가
+                else:
+                    retry_delay = 60 + (attempt * 30)  # 점진적 증가
+                
+                if attempt < max_retries - 1:
+                    print(f"할당량 초과 (429). {retry_delay}초 후 재시도... ({attempt + 1}/{max_retries})")
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    raise Exception(f"Gemini 분석 실패: 할당량 초과. {retry_delay}초 후 다시 시도해주세요. 모델: {GEMINI_MODEL}\n에러: {error_str}")
+            else:
+                # 다른 에러는 즉시 실패
+                raise Exception(f"Gemini 분석 실패: {error_str}")
+    
+    raise Exception(f"Gemini 분석 실패: 최대 재시도 횟수({max_retries}) 초과")
 
 
 def search_internet(query: str) -> str:
