@@ -69,6 +69,70 @@ SYSTEM_PROMPT = """### System Prompt: Video Analysis & Research Expert
 """
 
 
+import requests as http_requests  # requests 라이브러리 import
+
+
+def is_youtube_url(url: str) -> bool:
+    """URL이 YouTube URL인지 확인"""
+    youtube_patterns = [
+        'youtube.com/watch',
+        'youtu.be/',
+        'youtube.com/embed/',
+        'youtube.com/shorts/',
+        'youtube.com/live/'
+    ]
+    return any(pattern in url for pattern in youtube_patterns)
+
+
+def is_direct_video_url(url: str) -> bool:
+    """URL이 직접 비디오 파일 URL인지 확인"""
+    video_extensions = ['.mp4', '.webm', '.mkv', '.avi', '.mov', '.m4v', '.flv']
+    url_lower = url.lower().split('?')[0]  # 쿼리 파라미터 제거
+    return any(url_lower.endswith(ext) for ext in video_extensions)
+
+
+def download_direct_video(url: str) -> str:
+    """직접 비디오 URL에서 비디오 다운로드 (MP4, WebM 등)"""
+    temp_video = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+    temp_video_path = temp_video.name
+    temp_video.close()
+    
+    try:
+        print(f"직접 비디오 URL 다운로드 시작: {url}")
+        
+        # 스트리밍 다운로드
+        response = http_requests.get(url, stream=True, timeout=60, headers={
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        })
+        response.raise_for_status()
+        
+        # 파일에 쓰기
+        with open(temp_video_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+        
+        # 파일 검증
+        file_size = os.path.getsize(temp_video_path)
+        if file_size == 0:
+            raise Exception("다운로드된 파일이 비어있습니다")
+        
+        if file_size < 1024:  # 1KB 미만
+            raise Exception(f"다운로드된 파일이 너무 작습니다 ({file_size} bytes)")
+        
+        print(f"직접 비디오 다운로드 완료: {temp_video_path} ({file_size} bytes)")
+        return temp_video_path
+        
+    except Exception as e:
+        # 실패 시 임시 파일 정리
+        if os.path.exists(temp_video_path):
+            try:
+                os.unlink(temp_video_path)
+            except:
+                pass
+        raise Exception(f"비디오 다운로드 실패: {str(e)}")
+
+
 def download_youtube_video(url: str) -> str:
     """YouTube 비디오 다운로드"""
     temp_video = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
@@ -125,6 +189,25 @@ def download_youtube_video(url: str) -> str:
             except:
                 pass
         raise Exception(f"YouTube 다운로드 실패: {str(e)}")
+
+
+def download_video(url: str) -> str:
+    """URL 유형에 따라 적절한 다운로드 방식 선택"""
+    if is_youtube_url(url):
+        print(f"YouTube URL 감지: {url}")
+        return download_youtube_video(url)
+    elif is_direct_video_url(url):
+        print(f"직접 비디오 URL 감지: {url}")
+        return download_direct_video(url)
+    else:
+        # 그 외의 경우 yt-dlp로 시도 (다양한 사이트 지원)
+        print(f"기타 URL, yt-dlp로 시도: {url}")
+        try:
+            return download_youtube_video(url)
+        except:
+            # yt-dlp 실패 시 직접 다운로드 시도
+            print("yt-dlp 실패, 직접 다운로드 시도...")
+            return download_direct_video(url)
 
 
 def extract_audio_from_video(video_path: str) -> tuple:
@@ -448,18 +531,18 @@ def analyze_video():
         # Content-Type 확인
         content_type = request.content_type or ''
         
-        # YouTube URL 처리 (JSON)
+        # URL 처리 (JSON) - YouTube, 직접 MP4 등 모든 비디오 URL 지원
         if 'application/json' in content_type:
             try:
                 data = request.get_json()
                 if not data or 'url' not in data:
-                    return jsonify({'error': 'YouTube URL이 필요합니다'}), 400
+                    return jsonify({'error': '비디오 URL이 필요합니다'}), 400
                 
-                youtube_url = data['url']
-                print(f"YouTube URL 다운로드: {youtube_url}")
-                temp_video_path = download_youtube_video(youtube_url)
+                video_url = data['url']
+                print(f"비디오 URL 다운로드: {video_url}")
+                temp_video_path = download_video(video_url)
             except Exception as e:
-                return jsonify({'error': f'JSON 파싱 실패: {str(e)}'}), 400
+                return jsonify({'error': f'비디오 다운로드 실패: {str(e)}'}), 400
         
         # 파일 업로드 처리 (multipart/form-data)
         elif 'video' in request.files:
